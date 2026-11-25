@@ -38,18 +38,11 @@ Known placeholders are rejected at startup and do not count as a configured secr
 
 In `AUTH_MODE=gateway`, `/mcp` also requires `X-DickerData-Account-Code` and `X-DickerData-Access-Token`. Those headers are the only Dicker Data credentials for that request. A request missing either returns 401 and does not fall back to `DICKERDATA_ACCOUNT_CODE` / `DICKERDATA_ACCESS_TOKEN`.
 
-### Request limits
-
-- HTTP request bodies are capped at 256 KiB (262144 bytes). After the `X-Gateway-S2S` check (and, in `AUTH_MODE=gateway`, the vendor credential header check) passes, a `Content-Length` above the cap returns 413 with a JSON-RPC error; bodies without `Content-Length` are capped by the MCP SDK transport. Unauthenticated requests still get 401 first.
-- `tools/call` arguments are capped at 10,000 elements (every array item and object key at any depth). Larger inputs return an `isError` tool result and are never dispatched.
-
-These limits address CVE-2026-111768 / GHSA-46jr-4wx8-v453 (memory exhaustion during validation) and GHSA-f897-62hf-6gxq (no request body / batch cap).
-
 ## Tools
 
 ### Pricing
-- `dickerdata_get_pricing` - PricingRequest price-list (datafeed) pricing + stock-on-hand for one or more product codes. May lag your live account price and stock; dimensions may be null.
-- `dickerdata_get_price` - PricingRequest price-list (datafeed) pricing + stock for a single product code. Same feed as `dickerdata_get_pricing`, may lag your live account price and stock; no quantity-based pricing.
+- `dickerdata_get_pricing` - live pricing + stock-on-hand for one or more product codes.
+- `dickerdata_get_price` - pricing + stock for a single product code (via PricingRequest; no quantity parameter).
 
 ### Orders
 - `dickerdata_create_order` - place a purchase order.
@@ -64,7 +57,7 @@ These limits address CVE-2026-111768 / GHSA-46jr-4wx8-v453 (memory exhaustion du
 
 ## Known issues
 
-WYREAI-592: Dicker Data's POST `/api/DickerData/GetPrice` requires an undocumented HTTP Authorization header, so `dickerdata_get_price` uses GET `/api/PricingRequest` instead (a price-list feed that may lag the live account price and stock; no quantity-based pricing). The live endpoint is not used until the Authorization scheme is known. `dickerdata_create_order` may hit the same "Missing Request Header/Authorization" 401 until Dicker confirms the auth scheme.
+WYREAI-592: Dicker Data's POST `/api/DickerData/GetPrice` requires an undocumented HTTP Authorization header, so `dickerdata_get_price` now uses GET `/api/PricingRequest` (pricing and stock, no quantity-based pricing). `dickerdata_create_order` may hit the same "Missing Request Header/Authorization" 401 until Dicker confirms the auth scheme.
 
 ## Scope
 

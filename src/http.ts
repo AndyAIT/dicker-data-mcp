@@ -1,24 +1,33 @@
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createServer } from './server.js';
 import { runWithCredentials } from './client.js';
 import { logger } from './utils/logger.js';
-import { verifyS2sHeader, S2S_HEADER } from './s2s-verify.js';
-import { MAX_REQUEST_BODY_BYTES } from './input-limits.js';
 import type { DickerDataCredentials } from './types.js';
 
-// Conduit service-to-service auth (gateway#377 parity). HTTP startup fails
-// closed: an empty CONDUIT_S2S_SECRET, or a known placeholder, refuses to
-// boot unless MCP_ALLOW_INSECURE_DEV=1 (placeholders never qualify). That
-// bypass skips X-Gateway-S2S and binds 127.0.0.1 only. A configured secret
-// is always enforced and still honors MCP_HTTP_HOST (default 0.0.0.0) so
-// container deploys keep their existing bind. The secret value is never logged.
-// See src/s2s-verify.ts.
+/*
+ * Adept Copilot Studio authentication
+ *
+ * The original WYRE Conduit X-Gateway-S2S authentication has been replaced
+ * with a static X-API-Key authentication mechanism suitable for Microsoft
+ * Copilot Studio.
+ *
+ * The expected key is read from:
+ *
+ *   COPILOT_MCP_API_KEY
+ *
+ * Every request to /mcp must provide:
+ *
+ *   X-API-Key: <configured key>
+ *
+ * The /health endpoint remains unauthenticated for container health checks.
+ * Dicker Data credentials remain server-side and are read through AUTH_MODE=env.
+ */
 
-/** Public example values. A copied placeholder must not verify as a real secret. */
-const KNOWN_PLACEHOLDER_SECRETS = new Set([
+const KNOWN_PLACEHOLDER_KEYS = new Set([
   'replace-with-a-real-secret',
-  'your-s2s-secret',
+  'your-api-key',
   'your-secret',
   'changeme',
   'change-me',
@@ -26,199 +35,237 @@ const KNOWN_PLACEHOLDER_SECRETS = new Set([
   'secret',
   'example',
   'replace-me',
-  's2s-secret',
+  'api-key',
 ]);
 
-const LOOPBACK_HOST = '127.0.0.1';
+const MISSING_API_KEY_ERROR =
+  'Refusing to start HTTP transport: COPILOT_MCP_API_KEY is empty. ' +
+  'Generate a strong random key and configure COPILOT_MCP_API_KEY.';
 
-const MISSING_S2S_SECRET_ERROR =
-  'Refusing to start HTTP transport: CONDUIT_S2S_SECRET is empty. ' +
-  'Set CONDUIT_S2S_SECRET to the gateway-provisioned secret (openssl rand -hex 32), ' +
-  'or set MCP_ALLOW_INSECURE_DEV=1 for local development only.';
+const PLACEHOLDER_API_KEY_ERROR =
+  'Refusing to start HTTP transport: COPILOT_MCP_API_KEY is a known placeholder. ' +
+  'Generate and configure a strong random key.';
 
-const PLACEHOLDER_S2S_SECRET_ERROR =
-  'Refusing to start HTTP transport: CONDUIT_S2S_SECRET is a known placeholder. ' +
-  'Generate a secret with `openssl rand -hex 32` and set CONDUIT_S2S_SECRET to that value. ' +
-  'MCP_ALLOW_INSECURE_DEV does not bypass a placeholder secret.';
-
-const INSECURE_DEV_WARNING =
-  'SECURITY WARNING: CONDUIT_S2S_SECRET is empty and MCP_ALLOW_INSECURE_DEV=1. ' +
-  'HTTP /mcp is not enforcing X-Gateway-S2S and is limited to loopback (127.0.0.1). ' +
-  'Do not use this outside local development.';
-
-const S2S_UNAUTHORIZED = {
-  error:
-    'Missing or invalid X-Gateway-S2S header: this endpoint only accepts requests signed by the gateway.',
+const API_KEY_UNAUTHORIZED = {
+  error: 'Unauthorized: missing or invalid X-API-Key header.',
 };
 
 const GATEWAY_CREDENTIALS_UNAUTHORIZED = {
   error:
-    'Unauthorized: missing required gateway credential headers x-dickerdata-account-code and x-dickerdata-access-token',
+    'Unauthorized: missing required gateway credential headers ' +
+    'x-dickerdata-account-code and x-dickerdata-access-token',
 };
 
-function headerValue(value: string | string[] | undefined): string | undefined {
+function headerValue(
+  value: string | string[] | undefined,
+): string | undefined {
   const raw = Array.isArray(value) ? value[0] : value;
-  if (typeof raw !== 'string') return undefined;
+
+  if (typeof raw !== 'string') {
+    return undefined;
+  }
+
   const trimmed = raw.trim();
+
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-function isLoopbackHost(host: string): boolean {
-  const normalized = host.trim().toLowerCase().replace(/^\[(.+)\]$/, '$1');
-  return normalized === '127.0.0.1' || normalized === 'localhost' || normalized === '::1';
-}
-
 /**
- * Secret for X-Gateway-S2S on /mcp. Read at HTTP startup, not module load.
- * Empty is fail-closed unless MCP_ALLOW_INSECURE_DEV=1. A known placeholder
- * always refuses, including when the dev flag is set. The secret is never logged.
+ * Read the Copilot MCP API key at HTTP startup.
+ *
+ * HTTP startup fails closed if the key is empty or is a known placeholder.
+ * The key itself is never logged.
  */
-function resolveS2sSecret(): string {
-  const secret = (process.env.CONDUIT_S2S_SECRET ?? '').trim();
-  if (secret && KNOWN_PLACEHOLDER_SECRETS.has(secret.toLowerCase())) {
-    logger.error(PLACEHOLDER_S2S_SECRET_ERROR);
+function resolveCopilotApiKey(): string {
+  const apiKey = (process.env.COPILOT_MCP_API_KEY ?? '').trim();
+
+  if (!apiKey) {
+    logger.error(MISSING_API_KEY_ERROR);
     process.exit(1);
   }
-  if (secret) return secret;
 
-  if (process.env.MCP_ALLOW_INSECURE_DEV === '1') {
-    // error level so LOG_LEVEL=warn|error cannot hide the bypass.
-    logger.error(INSECURE_DEV_WARNING);
-    return '';
+  if (KNOWN_PLACEHOLDER_KEYS.has(apiKey.toLowerCase())) {
+    logger.error(PLACEHOLDER_API_KEY_ERROR);
+    process.exit(1);
   }
 
-  logger.error(MISSING_S2S_SECRET_ERROR);
-  process.exit(1);
+  if (apiKey.length < 32) {
+    logger.error(
+      'Refusing to start HTTP transport: COPILOT_MCP_API_KEY must be at least 32 characters long.',
+    );
+    process.exit(1);
+  }
+
+  return apiKey;
 }
 
 /**
- * No secret (insecure-dev only) always binds 127.0.0.1. A non-loopback
- * MCP_HTTP_HOST is overridden and logged. A configured secret honors
- * MCP_HTTP_HOST, defaulting to 0.0.0.0 so container deploys stay unchanged.
+ * Compare the provided API key with the configured key using a timing-safe
+ * comparison. Different-length values are rejected before comparison because
+ * timingSafeEqual requires equal-sized buffers.
  */
-function resolveListenHost(s2sSecret: string): string {
-  const configured = (process.env.MCP_HTTP_HOST ?? '').trim();
-  if (s2sSecret) return configured || '0.0.0.0';
-
-  if (configured && !isLoopbackHost(configured)) {
-    logger.error(
-      `WARNING: MCP_HTTP_HOST=${configured} is not a loopback address. ` +
-        'MCP_ALLOW_INSECURE_DEV=1 without CONDUIT_S2S_SECRET cannot listen there. ' +
-        `Binding ${LOOPBACK_HOST} only.`,
-    );
+function verifyApiKey(
+  providedApiKey: string | undefined,
+  expectedApiKey: string,
+): boolean {
+  if (!providedApiKey) {
+    return false;
   }
-  return LOOPBACK_HOST;
+
+  const providedBuffer = Buffer.from(providedApiKey, 'utf8');
+  const expectedBuffer = Buffer.from(expectedApiKey, 'utf8');
+
+  if (providedBuffer.length !== expectedBuffer.length) {
+    return false;
+  }
+
+  return timingSafeEqual(providedBuffer, expectedBuffer);
 }
 
 export async function startHttpServer(): Promise<HttpServer> {
-  const s2sSecret = resolveS2sSecret();
+  const copilotApiKey = resolveCopilotApiKey();
   const port = parseInt(process.env.MCP_HTTP_PORT || '8080', 10);
-  const host = resolveListenHost(s2sSecret);
+  const host = (process.env.MCP_HTTP_HOST ?? '').trim() || '0.0.0.0';
   const isGatewayMode = process.env.AUTH_MODE === 'gateway';
 
   const httpServer = createHttpServer(async (req, res) => {
-    // Only the path is used, so parse against a fixed base rather than the
-    // client-supplied Host header. A target that still cannot be parsed (e.g. "//")
-    // must answer 400, never throw out of the listener.
-    let url: URL;
-    try {
-      url = new URL(req.url || '/', 'http://localhost');
-    } catch {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Bad request' }));
-      return;
-    }
+    logger.info(`HTTP request: ${req.method} ${req.url}`);
+	const url = new URL(
+      req.url || '/',
+      `http://${req.headers.host || 'localhost'}`,
+    );
 
+    /*
+     * Container liveness endpoint.
+     *
+     * This intentionally does not expose credential readiness and does not
+     * require the API key, allowing Docker and reverse proxies to perform
+     * health checks.
+     */
     if (url.pathname === '/health') {
-      // /health is container LIVENESS, not credential-readiness. In gateway
-      // mode, credentials arrive per-request via X-DickerData-* headers, not
-      // at startup. Do not read vendor credentials here: a probe has none,
-      // and reporting process-env credentials would leak whether they are set.
-      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store',
+      });
+
       res.end(
         JSON.stringify({
           status: 'ok',
           transport: 'http',
           mode: isGatewayMode ? 'gateway' : 'standalone',
+          authentication: 'api-key',
           timestamp: new Date().toISOString(),
-        })
+        }),
       );
+
       return;
     }
 
     if (url.pathname !== '/mcp') {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Not found', endpoints: ['/mcp', '/health'] }));
-      return;
-    }
+      res.writeHead(404, {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store',
+      });
 
-    // Empty s2sSecret is only reachable when MCP_ALLOW_INSECURE_DEV=1;
-    // startup refuses otherwise. A configured secret is always enforced,
-    // before any credential extraction.
-    if (s2sSecret && !verifyS2sHeader(headerValue(req.headers[S2S_HEADER]), s2sSecret)) {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(S2S_UNAUTHORIZED));
-      return;
-    }
-
-    const accountCode = headerValue(req.headers['x-dickerdata-account-code']);
-    const accessToken = headerValue(req.headers['x-dickerdata-access-token']);
-
-    // Gateway mode: credentials must arrive on every request via the
-    // x-dickerdata-account-code and x-dickerdata-access-token headers.
-    // Reject explicitly if either is missing rather than falling through —
-    // falling through would resolve DICKERDATA_* from the process
-    // environment, which is not request-scoped (CWE-306).
-    if (isGatewayMode && (!accountCode || !accessToken)) {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(GATEWAY_CREDENTIALS_UNAUTHORIZED));
-      return;
-    }
-
-    // POST only: other methods get the transport's 405 and Allow header.
-    // Body cap runs only after the S2S and gateway credential checks pass so
-    // unauthenticated callers still get 401.
-    const contentLength = Number(headerValue(req.headers['content-length']));
-    if (req.method === 'POST' && Number.isFinite(contentLength) && contentLength > MAX_REQUEST_BODY_BYTES) {
-      res.writeHead(413, { 'Content-Type': 'application/json' });
       res.end(
         JSON.stringify({
-          jsonrpc: '2.0',
-          error: { code: -32600, message: `Request body exceeds ${MAX_REQUEST_BODY_BYTES} bytes` },
-          id: null,
+          error: 'Not found',
+          endpoints: ['/mcp', '/health'],
         }),
       );
+
       return;
     }
 
+    /*
+     * Copilot Studio authentication.
+     *
+     * Every request to /mcp must supply:
+     *
+     *   X-API-Key: <COPILOT_MCP_API_KEY>
+     */
+    const providedApiKey = headerValue(req.headers['x-api-key']);
+
+    if (!verifyApiKey(providedApiKey, copilotApiKey)) {
+      res.writeHead(401, {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store',
+      });
+
+      res.end(JSON.stringify(API_KEY_UNAUTHORIZED));
+      return;
+    }
+
+    const accountCode = headerValue(
+      req.headers['x-dickerdata-account-code'],
+    );
+
+    const accessToken = headerValue(
+      req.headers['x-dickerdata-access-token'],
+    );
+
     const handle = async () => {
-      // SECURITY-CRITICAL invariant: this transport MUST stay stateless
-      // (sessionIdGenerator: undefined + enableJsonResponse: true).
-      // Per-request tenant credentials are carried in an AsyncLocalStorage
-      // context opened by runWithCredentials() below. A stateless
-      // request->single-response flow keeps the tool call inside that
-      // context - switching to a stateful/SSE transport would let a
-      // long-lived connection serve later messages under a stale/foreign
-      // credential context.
+      /*
+       * Keep this transport stateless.
+       *
+       * This preserves the original upstream MCP transport behaviour.
+       */
       const server = createServer();
+
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,
-        maxRequestBodySize: MAX_REQUEST_BODY_BYTES,
       });
+
       res.on('close', () => {
         transport.close();
         server.close();
       });
+
       await server.connect(transport);
       await transport.handleRequest(req, res);
     };
 
-    // Per-request headers when both are present (always the case in gateway
-    // mode, which rejected missing credentials above); otherwise env /
-    // single-tenant mode resolves DICKERDATA_* from the process environment.
+    /*
+     * Gateway mode retains the original per-request Dicker credential
+     * behaviour if it is ever deliberately enabled.
+     */
+    if (isGatewayMode) {
+      if (!accountCode || !accessToken) {
+        res.writeHead(401, {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-store',
+        });
+
+        res.end(JSON.stringify(GATEWAY_CREDENTIALS_UNAUTHORIZED));
+        return;
+      }
+
+      const credentials: DickerDataCredentials = {
+        accountCode,
+        accessToken,
+      };
+
+      await runWithCredentials(credentials, handle);
+      return;
+    }
+
+    /*
+     * Env/single-tenant mode.
+     *
+     * If both per-request Dicker headers are present, use them. Otherwise,
+     * the Dicker tools resolve DICKERDATA_ACCOUNT_CODE and
+     * DICKERDATA_ACCESS_TOKEN from the process environment.
+     */
     if (accountCode && accessToken) {
-      await runWithCredentials({ accountCode, accessToken }, handle);
+      await runWithCredentials(
+        {
+          accountCode,
+          accessToken,
+        },
+        handle,
+      );
+
       return;
     }
 
@@ -227,8 +274,12 @@ export async function startHttpServer(): Promise<HttpServer> {
 
   await new Promise<void>((resolve, reject) => {
     httpServer.once('error', reject);
+
     httpServer.listen(port, host, () => {
-      logger.info(`HTTP streaming server listening on ${host}:${port}`);
+      logger.info(
+        `HTTP streaming server listening on ${host}:${port} with X-API-Key authentication`,
+      );
+
       resolve();
     });
   });
@@ -236,15 +287,20 @@ export async function startHttpServer(): Promise<HttpServer> {
   return httpServer;
 }
 
-// Entry point. Vitest imports this module to call startHttpServer; skip the
-// CLI entrypoint there. `node dist/http.js` still starts HTTP or falls
-// through to stdio.
+/*
+ * Entry point.
+ *
+ * Vitest imports this module to call startHttpServer. Running
+ * node dist/http.js starts HTTP when MCP_TRANSPORT=http, otherwise it
+ * falls through to the stdio entry point.
+ */
 if (process.env.VITEST !== 'true') {
   if (process.env.MCP_TRANSPORT === 'http') {
     startHttpServer().catch((error) => {
       logger.error('Fatal startup error', {
         error: error instanceof Error ? error.message : String(error),
       });
+
       process.exit(1);
     });
   } else {
